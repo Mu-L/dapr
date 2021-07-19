@@ -14,6 +14,9 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/dapr/kit/logger"
+
+	"github.com/dapr/dapr/pkg/acl"
 	global_config "github.com/dapr/dapr/pkg/config"
 	env "github.com/dapr/dapr/pkg/config/env"
 	"github.com/dapr/dapr/pkg/cors"
@@ -24,13 +27,13 @@ import (
 	"github.com/dapr/dapr/pkg/runtime/security"
 	"github.com/dapr/dapr/pkg/version"
 	"github.com/dapr/dapr/utils"
-	"github.com/dapr/kit/logger"
 )
 
-// FromFlags parses command flags and returns DaprRuntime instance
+// FromFlags parses command flags and returns DaprRuntime instance.
 func FromFlags() (*DaprRuntime, error) {
 	mode := flag.String("mode", string(modes.StandaloneMode), "Runtime mode for Dapr")
 	daprHTTPPort := flag.String("dapr-http-port", fmt.Sprintf("%v", DefaultDaprHTTPPort), "HTTP port for Dapr API to listen on")
+	daprAPIListenAddress := flag.String("dapr-listen-address", DefaultAPIListenAddress, "address for the Dapr API to listen on")
 	daprAPIGRPCPort := flag.String("dapr-grpc-port", fmt.Sprintf("%v", DefaultDaprAPIGRPCPort), "gRPC port for the Dapr API to listen on")
 	daprInternalGRPCPort := flag.String("dapr-internal-grpc-port", "", "gRPC port for the Dapr Internal API to listen on")
 	appPort := flag.String("app-port", "", "The port the application is listening on")
@@ -45,6 +48,8 @@ func FromFlags() (*DaprRuntime, error) {
 	allowedOrigins := flag.String("allowed-origins", cors.DefaultAllowedOrigins, "Allowed HTTP origins")
 	enableProfiling := flag.Bool("enable-profiling", false, "Enable profiling")
 	runtimeVersion := flag.Bool("version", false, "Prints the runtime version")
+	buildInfo := flag.Bool("build-info", false, "Prints the build info")
+	waitCommand := flag.Bool("wait", false, "wait for Dapr outbound ready")
 	appMaxConcurrency := flag.Int("app-max-concurrency", -1, "Controls the concurrency level when forwarding requests to user code")
 	enableMTLS := flag.Bool("enable-mtls", false, "Enables automatic mTLS for daprd to daprd communication channels")
 	appSSL := flag.Bool("app-ssl", false, "Sets the URI scheme of the app to https and attempts an SSL connection")
@@ -61,6 +66,19 @@ func FromFlags() (*DaprRuntime, error) {
 
 	if *runtimeVersion {
 		fmt.Println(version.Version())
+		os.Exit(0)
+	}
+
+	if *buildInfo {
+		fmt.Printf("Version: %s\nGit Commit: %s\nGit Version: %s\n", version.Version(), version.Commit(), version.GitVersion())
+		os.Exit(0)
+	}
+
+	if *waitCommand {
+		err := waitUntilDaprOutboundReady(*daprHTTPPort)
+		if err != nil {
+			os.Exit(1)
+		}
 		os.Exit(0)
 	}
 
@@ -141,7 +159,7 @@ func FromFlags() (*DaprRuntime, error) {
 	}
 
 	runtimeConfig := NewRuntimeConfig(*appID, placementAddresses, *controlPlaneAddress, *allowedOrigins, *config, *componentsPath,
-		appPrtcl, *mode, daprHTTP, daprInternalGRPC, daprAPIGRPC, applicationPort, profPort, *enableProfiling, concurrency, *enableMTLS, *sentryAddress, *appSSL, maxRequestBodySize)
+		appPrtcl, *mode, daprHTTP, daprInternalGRPC, daprAPIGRPC, *daprAPIListenAddress, applicationPort, profPort, *enableProfiling, concurrency, *enableMTLS, *sentryAddress, *appSSL, maxRequestBodySize)
 
 	// set environment variables
 	// TODO - consider adding host address to runtime config and/or caching result in utils package
@@ -205,7 +223,7 @@ func FromFlags() (*DaprRuntime, error) {
 		globalConfig = global_config.LoadDefaultConfiguration()
 	}
 
-	accessControlList, err = global_config.ParseAccessControlSpec(globalConfig.Spec.AccessControlSpec, string(runtimeConfig.ApplicationProtocol))
+	accessControlList, err = acl.ParseAccessControlSpec(globalConfig.Spec.AccessControlSpec, string(runtimeConfig.ApplicationProtocol))
 	if err != nil {
 		log.Fatalf(err.Error())
 	}

@@ -13,12 +13,6 @@ import (
 	"strconv"
 	"strings"
 
-	scheme "github.com/dapr/dapr/pkg/client/clientset/versioned"
-	"github.com/dapr/dapr/pkg/credentials"
-	auth "github.com/dapr/dapr/pkg/runtime/security"
-	"github.com/dapr/dapr/pkg/sentry/certs"
-	"github.com/dapr/dapr/pkg/validation"
-	"github.com/dapr/dapr/utils"
 	"github.com/pkg/errors"
 	v1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -26,6 +20,13 @@ import (
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
+
+	scheme "github.com/dapr/dapr/pkg/client/clientset/versioned"
+	"github.com/dapr/dapr/pkg/credentials"
+	auth "github.com/dapr/dapr/pkg/runtime/security"
+	"github.com/dapr/dapr/pkg/sentry/certs"
+	"github.com/dapr/dapr/pkg/validation"
+	"github.com/dapr/dapr/utils"
 )
 
 const (
@@ -50,6 +51,7 @@ const (
 	daprMemoryLimitKey                = "dapr.io/sidecar-memory-limit"
 	daprCPURequestKey                 = "dapr.io/sidecar-cpu-request"
 	daprMemoryRequestKey              = "dapr.io/sidecar-memory-request"
+	daprListenAddress                 = "dapr.io/sidecar-listen-address"
 	daprLivenessProbeDelayKey         = "dapr.io/sidecar-liveness-probe-delay-seconds"
 	daprLivenessProbeTimeoutKey       = "dapr.io/sidecar-liveness-probe-timeout-seconds"
 	daprLivenessProbePeriodKey        = "dapr.io/sidecar-liveness-probe-period-seconds"
@@ -69,6 +71,9 @@ const (
 	apiAddress                        = "dapr-api"
 	placementService                  = "dapr-placement-server"
 	sentryService                     = "dapr-sentry"
+	apiPort                           = 80
+	placementServicePort              = 50005
+	sentryServicePort                 = 80
 	sidecarHTTPPortName               = "dapr-http"
 	sidecarGRPCPortName               = "dapr-grpc"
 	sidecarInternalGRPCPortName       = "dapr-internal"
@@ -83,6 +88,7 @@ const (
 	defaultMetricsPort                = 9090
 	defaultSidecarDebug               = false
 	defaultSidecarDebugPort           = 40000
+	defaultSidecarListenAddress       = "localhost"
 	sidecarHealthzPath                = "healthz"
 	defaultHealthzProbeDelaySeconds   = 3
 	defaultHealthzProbeTimeoutSeconds = 3
@@ -125,9 +131,9 @@ func (i *injector) getPodPatchOperations(ar *v1.AdmissionReview,
 	}
 
 	// Keep DNS resolution outside of getSidecarContainer for unit testing.
-	placementAddress := fmt.Sprintf("%s:50005", getKubernetesDNS(placementService, namespace))
-	sentryAddress := fmt.Sprintf("%s:80", getKubernetesDNS(sentryService, namespace))
-	apiSrvAddress := fmt.Sprintf("%s:80", getKubernetesDNS(apiAddress, namespace))
+	placementAddress := getServiceAddress(placementService, namespace, i.config.KubeClusterDomain, placementServicePort)
+	sentryAddress := getServiceAddress(sentryService, namespace, i.config.KubeClusterDomain, sentryServicePort)
+	apiSvcAddress := getServiceAddress(apiAddress, namespace, i.config.KubeClusterDomain, apiPort)
 
 	var trustAnchors string
 	var certChain string
@@ -141,7 +147,7 @@ func (i *injector) getPodPatchOperations(ar *v1.AdmissionReview,
 	}
 
 	tokenMount := getTokenVolumeMount(pod)
-	sidecarContainer, err := getSidecarContainer(pod.Annotations, id, image, imagePullPolicy, req.Namespace, apiSrvAddress, placementAddress, tokenMount, trustAnchors, certChain, certKey, sentryAddress, mtlsEnabled, identity)
+	sidecarContainer, err := getSidecarContainer(pod.Annotations, id, image, imagePullPolicy, req.Namespace, apiSvcAddress, placementAddress, tokenMount, trustAnchors, certChain, certKey, sentryAddress, mtlsEnabled, identity)
 	if err != nil {
 		return nil, err
 	}
@@ -339,6 +345,10 @@ func getMaxRequestBodySize(annotations map[string]string) (int32, error) {
 	return getInt32Annotation(annotations, daprMaxRequestBodySize)
 }
 
+func getListenAddress(annotations map[string]string) string {
+	return getStringAnnotationOrDefault(annotations, daprListenAddress, defaultSidecarListenAddress)
+}
+
 func getBoolAnnotationOrDefault(annotations map[string]string, key string, defaultValue bool) bool {
 	enabled, ok := annotations[key]
 	if !ok {
@@ -389,6 +399,19 @@ func getProbeHTTPHandler(port int32, pathElements ...string) corev1.Handler {
 		HTTPGet: &corev1.HTTPGetAction{
 			Path: formatProbePath(pathElements...),
 			Port: intstr.IntOrString{IntVal: port},
+		},
+	}
+}
+
+func getProbeExecHandler(port int32) corev1.Handler {
+	return corev1.Handler{
+		Exec: &corev1.ExecAction{
+			Command: []string{
+				"/daprd",
+				"--wait",
+				"--dapr-http-port",
+				fmt.Sprintf("%v", port),
+			},
 		},
 	}
 }
@@ -458,8 +481,8 @@ func isResourceDaprEnabled(annotations map[string]string) bool {
 	return getBoolAnnotationOrDefault(annotations, daprEnabledKey, false)
 }
 
-func getKubernetesDNS(name, namespace string) string {
-	return fmt.Sprintf("%s.%s.svc.cluster.local", name, namespace)
+func getServiceAddress(name, namespace, clusterDomain string, port int) string {
+	return fmt.Sprintf("%s.%s.svc.%s:%d", name, namespace, clusterDomain, port)
 }
 
 func getPullPolicy(pullPolicy string) corev1.PullPolicy {
@@ -488,6 +511,7 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, im
 	metricsEnabled := getEnableMetrics(annotations)
 	metricsPort := getMetricsPort(annotations)
 	maxConcurrency, err := getMaxConcurrency(annotations)
+	sidecarListenAddress := getListenAddress(annotations)
 	if err != nil {
 		log.Warn(err)
 	}
@@ -496,7 +520,14 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, im
 
 	pullPolicy := getPullPolicy(imagePullPolicy)
 
-	httpHandler := getProbeHTTPHandler(sidecarHTTPPort, apiVersionV1, sidecarHealthzPath)
+	var probeHandler corev1.Handler
+
+	if sidecarListenAddress == "localhost" {
+		// kubelet healthcheck cannot talk to localhost for a pod, so we use daprd --wait to run the healthcheck instead
+		probeHandler = getProbeExecHandler(sidecarHTTPPort)
+	} else {
+		probeHandler = getProbeHTTPHandler(sidecarHTTPPort, apiVersionV1, sidecarHealthzPath)
+	}
 
 	allowPrivilegeEscalation := false
 
@@ -531,6 +562,7 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, im
 		"--dapr-http-port", fmt.Sprintf("%v", sidecarHTTPPort),
 		"--dapr-grpc-port", fmt.Sprintf("%v", sidecarAPIGRPCPort),
 		"--dapr-internal-grpc-port", fmt.Sprintf("%v", sidecarInternalGRPCPort),
+		"--dapr-listen-address", sidecarListenAddress,
 		"--app-port", appPortStr,
 		"--app-id", id,
 		"--control-plane-address", controlPlaneAddress,
@@ -584,14 +616,14 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, im
 		},
 		Args: args,
 		ReadinessProbe: &corev1.Probe{
-			Handler:             httpHandler,
+			Handler:             probeHandler,
 			InitialDelaySeconds: getInt32AnnotationOrDefault(annotations, daprReadinessProbeDelayKey, defaultHealthzProbeDelaySeconds),
 			TimeoutSeconds:      getInt32AnnotationOrDefault(annotations, daprReadinessProbeTimeoutKey, defaultHealthzProbeTimeoutSeconds),
 			PeriodSeconds:       getInt32AnnotationOrDefault(annotations, daprReadinessProbePeriodKey, defaultHealthzProbePeriodSeconds),
 			FailureThreshold:    getInt32AnnotationOrDefault(annotations, daprReadinessProbeThresholdKey, defaultHealthzProbeThreshold),
 		},
 		LivenessProbe: &corev1.Probe{
-			Handler:             httpHandler,
+			Handler:             probeHandler,
 			InitialDelaySeconds: getInt32AnnotationOrDefault(annotations, daprLivenessProbeDelayKey, defaultHealthzProbeDelaySeconds),
 			TimeoutSeconds:      getInt32AnnotationOrDefault(annotations, daprLivenessProbeTimeoutKey, defaultHealthzProbeTimeoutSeconds),
 			PeriodSeconds:       getInt32AnnotationOrDefault(annotations, daprLivenessProbePeriodKey, defaultHealthzProbePeriodSeconds),
